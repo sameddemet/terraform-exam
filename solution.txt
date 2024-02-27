@@ -1,0 +1,178 @@
+# Providers
+
+## Provider classique utilisant mon profil "hati"
+provider "aws" {
+  region  = "eu-west-3"
+  profile = "hati"
+}
+
+## Provider pour le Wildcard SSL
+provider "aws" {
+  region  = "us-east-1"
+  alias   = "us-east-1"
+  profile = "hati"
+}
+
+# Bucket S3
+
+## On initialise/créé le bucket
+### https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket
+
+resource "aws_s3_bucket" "correction_s13" {
+  bucket = "correction-s13-devops-oclock-school"
+  tags = {
+    Name = "Bucket pour la correction examen S13"
+  }
+}
+
+## On téléverse notre index.html
+### https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_object
+
+resource "aws_s3_object" "index_html" {
+  bucket       = aws_s3_bucket.correction_s13.id
+  key          = "index.html"
+  source       = "resources/index.html"
+  content_type = "text/html"
+
+  # The filemd5() function is available in Terraform 0.11.12 and later
+  # For Terraform 0.11.11 and earlier, use the md5() function and the file() function:
+  # etag = "${md5(file("path/to/file"))}"
+  etag = filemd5("resources/index.html")
+}
+
+# Lien CloudFront & S3
+## Il faut créer une identity OAI (1), ajouter une policy pour autoriser l'accès 
+## au bucket S3 (2) et enfin associer l'OAI à la distribution CloudFront (3)
+
+## Création identity OAI (1)
+
+resource "aws_cloudfront_origin_access_identity" "oai" {
+  comment = "OAI pour accéder à S3 depuis CloudFront"
+}
+
+## Policy pour accès à OAI/S3 (2)
+
+resource "aws_s3_bucket_policy" "bucket_policy_oai" {
+  bucket = aws_s3_bucket.correction_s13.id
+  policy = jsonencode({
+    Version = "2008-10-17"
+    Id      = "PolicyForCloudFrontPrivateContent"
+    Statement = [
+      {
+        Action    = "s3:GetObject"
+        Effect    = "Allow"
+        Resource  = "${aws_s3_bucket.correction_s13.arn}/*"
+        Principal = { AWS = "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${aws_cloudfront_origin_access_identity.oai.id}" }
+      },
+    ]
+  })
+}
+
+## Associer l'OAI à la distribution CloudFront (3) : celle ci sera faite à la
+## création de la distribution CloudFront
+
+# Certificat SSL
+## Pour associer un certificat SSL on utilisera un Wildcard qui doit être hébergé 
+## sur us-east-1 et le récupérer via un data source
+### https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/acm_certificate
+### https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cnames-and-https-requirements.html
+
+data "aws_acm_certificate" "wildcard_devops" {
+  domain      = "*.devops.oclock.school"
+  statuses    = ["ISSUED"]
+  most_recent = true
+  provider    = aws.us-east-1
+}
+
+# Distribution CloudFront
+## On créé toute la distribution CloudFront via une unique ressource et on y 
+## référencera notre certificat SSL mais aussi le lien avec l'OAI (3)
+### https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudfront_distribution
+
+resource "aws_cloudfront_distribution" "s3_distribution" {
+  enabled             = true
+  comment             = "CloudFront de Correction pour examen S13"
+  default_root_object = "index.html"
+
+  origin {
+    domain_name = aws_s3_bucket.correction_s13.bucket_regional_domain_name
+    origin_id   = aws_s3_bucket.correction_s13.bucket
+
+    # Le lien avec l'OAI est fait ici (3)
+    s3_origin_config {
+      origin_access_identity = aws_cloudfront_origin_access_identity.oai.cloudfront_access_identity_path
+    }
+  }
+
+  aliases = ["correction.devops.oclock.school"]
+
+  default_cache_behavior {
+    allowed_methods  = ["GET", "HEAD"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = aws_s3_bucket.correction_s13.bucket
+
+    forwarded_values {
+      query_string = false
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
+  }
+
+  viewer_certificate {
+    acm_certificate_arn      = data.aws_acm_certificate.wildcard_devops.arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+}
+
+# DNS
+## On récupère notre zone existante via un data source
+### https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/route53_zone
+
+data "aws_route53_zone" "devops_oclock_school" {
+  name         = "devops.oclock.school."
+  private_zone = false
+}
+
+resource "aws_route53_record" "correction_dns" {
+  zone_id = data.aws_route53_zone.devops_oclock_school.id
+  name    = "correction.devops.oclock.school"
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.s3_distribution.domain_name
+    zone_id                = aws_cloudfront_distribution.s3_distribution.hosted_zone_id
+    evaluate_target_health = false
+  }
+
+  depends_on = [aws_cloudfront_distribution.s3_distribution]
+}
+
+# Output
+
+output "cloudfront_distribution_id" {
+  value       = aws_cloudfront_distribution.s3_distribution.id
+  description = "The ID of the CloudFront distribution"
+}
+
+output "cloudfront_distribution_domain_name" {
+  value       = aws_cloudfront_distribution.s3_distribution.domain_name
+  description = "The domain name (DNS) of the CloudFront distribution"
+}
+
+output "router53_record_fqdn" {
+  value       = aws_route53_record.correction_dns.fqdn
+  description = "The full qualified domain name (FQDN) of the Route53 entry"
+}
